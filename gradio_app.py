@@ -518,6 +518,21 @@ css = """
     object-fit: contain;
     width: 100%;
 }
+.scrollable-gallery {
+    overflow-y: auto !important;
+}
+.scrollable-gallery .grid-wrap {
+    max-height: none !important;
+    overflow: visible !important;
+}
+.scrollable-gallery-sm {
+    max-height: 300px !important;
+    overflow-y: auto !important;
+}
+.scrollable-gallery-lg {
+    max-height: 800px !important;
+    overflow-y: auto !important;
+}
 """
 
 with gr.Blocks(css=css) as demo:
@@ -564,9 +579,10 @@ with gr.Blocks(css=css) as demo:
                     value=get_test_images(),
                     label="Test Images",
                     columns=4,
-                    height=300,
+                    height=200,
                     object_fit="contain",
-                    allow_preview=False
+                    allow_preview=False,
+                    elem_classes="scrollable-gallery scrollable-gallery-sm"
                 )
                 
         with gr.Column():
@@ -583,7 +599,8 @@ with gr.Blocks(css=css) as demo:
                         label="Batch Results",
                         columns=4,
                         height=400,
-                        object_fit="contain"
+                        object_fit="contain",
+                        elem_classes="scrollable-gallery"
                     )
                 
                 with gr.TabItem("Video Result", id="video_tab"):
@@ -612,7 +629,8 @@ with gr.Blocks(css=css) as demo:
                 columns=5,
                 height=800,
                 object_fit="contain",
-                allow_preview=True
+                allow_preview=True,
+                elem_classes="scrollable-gallery scrollable-gallery-lg"
             )
 
     def on_clear_temp_change(value):

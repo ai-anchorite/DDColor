@@ -11,7 +11,7 @@ from basicsr.archs.ddcolor_arch import DDColor
 import torch.nn.functional as F
 
 import gradio as gr
-from gradio import ImageSlider
+from gradio_imageslider import ImageSlider
 from huggingface_hub import hf_hub_download
 import uuid
 from PIL import Image
@@ -24,6 +24,8 @@ import json
 
 model_size = 'large'
 MAX_GALLERY_IMAGES = 50
+VALID_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'}
+VALID_VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
 
 # Create outputs folder
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), 'outputs')
@@ -298,34 +300,261 @@ def load_test_image(evt: gr.SelectData):
         return test_images[evt.index]
     return None
 
-# CSS for responsive image windows
+def is_valid_image(filepath):
+    """Check if file is a valid image based on extension"""
+    if filepath is None:
+        return False
+    ext = os.path.splitext(filepath)[1].lower()
+    return ext in VALID_IMAGE_EXTENSIONS
+
+def get_images_from_folder(folder_path):
+    """Get all valid image files from a folder"""
+    if not folder_path or not os.path.isdir(folder_path):
+        return []
+    images = []
+    for f in os.listdir(folder_path):
+        full_path = os.path.join(folder_path, f)
+        if os.path.isfile(full_path) and is_valid_image(full_path):
+            images.append(full_path)
+    return sorted(images)
+
+def check_ffmpeg():
+    """Check if ffmpeg is available"""
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+def colorize_images(image_paths, output_dir, progress_tracker=None, desc="Colorizing"):
+    """Core colorization function - processes images and saves to output_dir.
+    Returns (results_rgb, saved_count, skipped_count)
+    """
+    global last_colorized_image
+    
+    results = []
+    saved_count = 0
+    skipped = 0
+    total = len(image_paths)
+    
+    for i, img_path in enumerate(image_paths):
+        # Update progress
+        if progress_tracker is not None:
+            progress_tracker((i + 1) / total, desc=f"{desc} ({i + 1}/{total})")
+        
+        try:
+            img = cv2.imread(img_path)
+            if img is None:
+                skipped += 1
+                continue
+            
+            output = colorizer.process(img)
+            output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
+            results.append(output_rgb)
+            
+            # Save to output directory
+            original_name = os.path.splitext(os.path.basename(img_path))[0]
+            save_path = os.path.join(output_dir, f"{original_name}_colorized.png")
+            cv2.imwrite(save_path, output)
+            saved_count += 1
+            
+            last_colorized_image = output.copy()
+        except Exception as e:
+            skipped += 1
+            continue
+    
+    return results, saved_count, skipped
+
+def process_batch(file_list, folder_path, autosave, input_size, progress=gr.Progress()):
+    """Process multiple images from file uploads and/or folder path"""
+    global last_status_message, last_status_type
+    
+    # Update model input size if changed
+    colorizer.update_input_size(input_size)
+    
+    # Collect all valid image paths
+    image_paths = []
+    
+    # From file uploads
+    if file_list:
+        for f in file_list:
+            fpath = f.name if hasattr(f, 'name') else f
+            if is_valid_image(fpath):
+                image_paths.append(fpath)
+    
+    # From folder
+    if folder_path and folder_path.strip():
+        folder_images = get_images_from_folder(folder_path.strip())
+        image_paths.extend(folder_images)
+    
+    if not image_paths:
+        last_status_message = "No valid images found. Supported: JPG, PNG, WEBP, BMP, TIFF"
+        last_status_type = "error"
+        return []
+    
+    # Create timestamped subfolder for batch output
+    batch_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    batch_folder_name = f"batch_{batch_timestamp}"
+    batch_output_dir = os.path.join(OUTPUTS_DIR, batch_folder_name)
+    os.makedirs(batch_output_dir, exist_ok=True)
+    
+    results, saved_count, skipped = colorize_images(image_paths, batch_output_dir, progress)
+    
+    # Build status message
+    msg_parts = [f"✅ Processed {len(results)} image(s)"]
+    msg_parts.append(f"saved to {batch_folder_name}/")
+    if skipped > 0:
+        msg_parts.append(f"skipped {skipped}")
+    
+    last_status_message = ", ".join(msg_parts)
+    last_status_type = "success"
+    
+    return results
+
+def process_video(video_path, input_size, progress=gr.Progress()):
+    """Extract frames from video, colorize them, and reassemble"""
+    global last_status_message, last_status_type
+    
+    if not video_path:
+        last_status_message = "Please upload a video first."
+        last_status_type = "error"
+        return None
+    
+    if not check_ffmpeg():
+        last_status_message = "❌ ffmpeg not found. Please install ffmpeg or run via Pinokio."
+        last_status_type = "error"
+        return None
+    
+    # Update model input size
+    colorizer.update_input_size(input_size)
+    
+    # Create working directories
+    video_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    work_dir = os.path.join(OUTPUTS_DIR, f"video_{video_timestamp}")
+    frames_dir = os.path.join(work_dir, "frames")
+    colorized_dir = os.path.join(work_dir, "colorized")
+    os.makedirs(frames_dir, exist_ok=True)
+    os.makedirs(colorized_dir, exist_ok=True)
+    
+    # Get video info (fps)
+    try:
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0', 
+             '-show_entries', 'stream=r_frame_rate', '-of', 'csv=p=0', video_path],
+            capture_output=True, text=True, check=True
+        )
+        fps_str = probe.stdout.strip()
+        if '/' in fps_str:
+            num, den = fps_str.split('/')
+            fps = float(num) / float(den)
+        else:
+            fps = float(fps_str)
+    except Exception:
+        fps = 30.0  # fallback
+    
+    # Extract frames
+    progress(0.05, desc="Extracting frames (this may take a moment)...")
+    try:
+        subprocess.run(
+            ['ffmpeg', '-i', video_path, '-qscale:v', '2', 
+             os.path.join(frames_dir, 'frame_%06d.png')],
+            capture_output=True, check=True
+        )
+    except subprocess.CalledProcessError as e:
+        last_status_message = f"❌ Failed to extract frames: {e.stderr.decode()[:200]}"
+        last_status_type = "error"
+        return None
+    
+    # Get frame list
+    frame_paths = sorted(glob(os.path.join(frames_dir, '*.png')))
+    if not frame_paths:
+        last_status_message = "❌ No frames extracted from video."
+        last_status_type = "error"
+        return None
+    
+    progress(0.1, desc=f"Extracted {len(frame_paths)} frames, starting colorization...")
+    
+    # Colorize frames
+    results, saved_count, skipped = colorize_images(frame_paths, colorized_dir, progress, desc="Colorizing")
+    
+    if saved_count == 0:
+        last_status_message = "❌ Failed to colorize any frames."
+        last_status_type = "error"
+        return None
+    
+    # Reassemble video
+    progress(0.9, desc="Assembling video...")
+    output_video = os.path.join(work_dir, f"{video_name}_colorized.mp4")
+    try:
+        subprocess.run(
+            ['ffmpeg', '-framerate', str(fps), '-i', os.path.join(colorized_dir, 'frame_%06d_colorized.png'),
+             '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18', output_video],
+            capture_output=True, check=True
+        )
+    except subprocess.CalledProcessError as e:
+        last_status_message = f"❌ Failed to assemble video: {e.stderr.decode()[:200]}"
+        last_status_type = "error"
+        return None
+    
+    # Cleanup frame directories to save space
+    shutil.rmtree(frames_dir)
+    shutil.rmtree(colorized_dir)
+    
+    last_status_message = f"✅ Video colorized! {saved_count} frames, saved to video_{video_timestamp}/"
+    last_status_type = "success"
+    
+    return output_video
+
+# CSS for responsive media windows
 css = """
-.image-window {
+.media-window {
     min-height: 300px !important;
     height: auto !important;
 }
-.image-window img {
+.media-window img,
+.media-window video {
     max-height: 60vh !important;
     object-fit: contain;
     width: 100%;
 }
 """
 
-# Gradio demo using the Image-Slider custom component
-with gr.Blocks() as demo:
+with gr.Blocks(css=css) as demo:
     with gr.Row():
         with gr.Column():
-            bw_image = gr.Image(label='Black and White Input Image', elem_classes="image-window")
-            
-            with gr.Row():
-                btn = gr.Button('Convert using DDColor', variant='primary', size="sm")
-                clear_btn = gr.Button('Clear', variant='secondary', scale=0, size="sm")
+            with gr.Tabs():
+                with gr.TabItem("Single Image"):
+                    bw_image = gr.Image(label='Black and White Input Image', elem_classes="media-window")
+                    
+                    with gr.Row():
+                        btn = gr.Button('Convert using DDColor', variant='primary', size="sm")
+                        clear_btn = gr.Button('Clear', variant='secondary', scale=0, size="sm")
+
+                with gr.TabItem("Batch"):
+                    batch_files = gr.File(
+                        label="Upload Images",
+                        file_count="multiple",
+                        file_types=["image"],
+                        type="filepath"
+                    )
+                    batch_folder = gr.Textbox(
+                        label="Or enter folder path",
+                        placeholder="C:\\path\\to\\images or /path/to/images",
+                        info="All valid images in folder will be processed"
+                    )
+                    batch_btn = gr.Button('Process Batch', variant='primary', size="sm")
+
+                with gr.TabItem("Video (Experimental WIP)"):
+                    video_input = gr.Video(label="Input Video", elem_classes="media-window")
+                    gr.Markdown("⚠️ *Experimental: Model isn't trained for video, results may vary. Uses ffmpeg.*")
+                    video_btn = gr.Button('Colorize Video', variant='primary', size="sm")
 
             input_size_radio = gr.Radio(
                 choices=[512, 768, 1024],
                 value=512,
                 label="Processing Size",
-                info="Higher = potentially better quality, more VRAM (~3GB/7GB/9GB). Changing size will reload the model - 1st gen always slow."
+                info="Higher = potentially better quality, more VRAM (~5GB/7GB/9GB). Changing size will reload the model - 1st gen always slow."
             )
 
             # Test images accordion
@@ -341,11 +570,24 @@ with gr.Blocks() as demo:
                 )
                 
         with gr.Column():
-            col_image_slider = gr.ImageSlider(
-                label="Before/After Comparison",
-                interactive=False,
-                elem_classes="image-window"
-            )
+            with gr.Tabs() as output_tabs:
+                with gr.TabItem("Single Result", id="single_tab"):
+                    col_image_slider = ImageSlider(position=0.5,
+                        label="Before/After Comparison",
+                        interactive=False,
+                        elem_classes="media-window"
+                    )
+                
+                with gr.TabItem("Batch Results", id="batch_tab"):
+                    batch_results_gallery = gr.Gallery(
+                        label="Batch Results",
+                        columns=4,
+                        height=400,
+                        object_fit="contain"
+                    )
+                
+                with gr.TabItem("Video Result", id="video_tab"):
+                    video_output = gr.Video(label="Colorized Video", elem_classes="media-window")
             
             # output controls
             with gr.Group():
@@ -383,8 +625,12 @@ with gr.Blocks() as demo:
         settings['autosave'] = value
         save_settings(settings)
     
-    # Event handlers - chain status/gallery update after colorize to avoid processing overlay
+    # Event handlers - switch to single result tab first, then colorize
     btn.click(
+        lambda: gr.update(selected="single_tab"),
+        None,
+        output_tabs
+    ).then(
         colorize, 
         [bw_image, autosave_checkbox, input_size_radio], 
         [col_image_slider]
@@ -400,5 +646,35 @@ with gr.Blocks() as demo:
     clear_temp_checkbox.change(on_clear_temp_change, [clear_temp_checkbox], None)
     autosave_checkbox.change(on_autosave_change, [autosave_checkbox], None)
     test_gallery.select(load_test_image, None, bw_image)
+    
+    # Batch processing - switch to batch results tab first
+    batch_btn.click(
+        lambda: gr.update(selected="batch_tab"),
+        None,
+        output_tabs
+    ).then(
+        process_batch,
+        [batch_files, batch_folder, autosave_checkbox, input_size_radio],
+        [batch_results_gallery]
+    ).then(
+        update_status_and_gallery,
+        None,
+        [save_status, output_gallery]
+    )
+    
+    # Video processing - switch to video result tab first
+    video_btn.click(
+        lambda: gr.update(selected="video_tab"),
+        None,
+        output_tabs
+    ).then(
+        process_video,
+        [video_input, input_size_radio],
+        [video_output]
+    ).then(
+        update_status_and_gallery,
+        None,
+        [save_status, output_gallery]
+    )
 
-demo.launch(css=css)
+demo.launch()

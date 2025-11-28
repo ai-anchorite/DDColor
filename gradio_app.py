@@ -411,8 +411,20 @@ def process_batch(file_list, folder_path, autosave, input_size, progress=gr.Prog
     
     return results
 
+def check_video_has_audio(video_path):
+    """Check if video has an audio stream"""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'a:0',
+             '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', video_path],
+            capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip() == 'audio'
+    except Exception:
+        return False
+
 def process_video(video_path, input_size, progress=gr.Progress()):
-    """Extract frames from video, colorize them, and reassemble"""
+    """Extract frames from video, colorize them, and reassemble with audio"""
     global last_status_message, last_status_type
     
     if not video_path:
@@ -437,6 +449,10 @@ def process_video(video_path, input_size, progress=gr.Progress()):
     os.makedirs(frames_dir, exist_ok=True)
     os.makedirs(colorized_dir, exist_ok=True)
     
+    # Check if video has audio
+    has_audio = check_video_has_audio(video_path)
+    audio_path = os.path.join(work_dir, "audio.aac") if has_audio else None
+    
     # Get video info (fps)
     try:
         probe = subprocess.run(
@@ -452,6 +468,25 @@ def process_video(video_path, input_size, progress=gr.Progress()):
             fps = float(fps_str)
     except Exception:
         fps = 30.0  # fallback
+    
+    # Extract audio if present
+    if has_audio:
+        progress(0.02, desc="Extracting audio...")
+        try:
+            subprocess.run(
+                ['ffmpeg', '-i', video_path, '-vn', '-acodec', 'copy', audio_path],
+                capture_output=True, check=True
+            )
+        except subprocess.CalledProcessError:
+            # Try re-encoding if copy fails
+            try:
+                subprocess.run(
+                    ['ffmpeg', '-i', video_path, '-vn', '-acodec', 'aac', '-b:a', '192k', audio_path],
+                    capture_output=True, check=True
+                )
+            except subprocess.CalledProcessError:
+                has_audio = False
+                audio_path = None
     
     # Extract frames
     progress(0.05, desc="Extracting frames (this may take a moment)...")
@@ -485,11 +520,13 @@ def process_video(video_path, input_size, progress=gr.Progress()):
     
     # Reassemble video
     progress(0.9, desc="Assembling video...")
+    output_video_noaudio = os.path.join(work_dir, f"{video_name}_colorized_noaudio.mp4")
     output_video = os.path.join(work_dir, f"{video_name}_colorized.mp4")
+    
     try:
         subprocess.run(
             ['ffmpeg', '-framerate', str(fps), '-i', os.path.join(colorized_dir, 'frame_%06d_colorized.png'),
-             '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18', output_video],
+             '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18', output_video_noaudio],
             capture_output=True, check=True
         )
     except subprocess.CalledProcessError as e:
@@ -497,11 +534,34 @@ def process_video(video_path, input_size, progress=gr.Progress()):
         last_status_type = "error"
         return None
     
-    # Cleanup frame directories to save space
+    # Reattach audio if present
+    audio_status = ""
+    if has_audio and audio_path and os.path.exists(audio_path):
+        progress(0.95, desc="Reattaching audio...")
+        try:
+            subprocess.run(
+                ['ffmpeg', '-i', output_video_noaudio, '-i', audio_path,
+                 '-c:v', 'copy', '-c:a', 'aac', '-shortest', output_video],
+                capture_output=True, check=True
+            )
+            # Remove the no-audio version
+            os.remove(output_video_noaudio)
+            audio_status = " with audio"
+        except subprocess.CalledProcessError:
+            # If audio merge fails, just use the video without audio
+            os.rename(output_video_noaudio, output_video)
+            audio_status = " (audio failed)"
+    else:
+        # No audio to attach
+        os.rename(output_video_noaudio, output_video)
+    
+    # Cleanup frame directories and audio to save space
     shutil.rmtree(frames_dir)
     shutil.rmtree(colorized_dir)
+    if audio_path and os.path.exists(audio_path):
+        os.remove(audio_path)
     
-    last_status_message = f"✅ Video colorized! {saved_count} frames, saved to video_{video_timestamp}/"
+    last_status_message = f"✅ Video colorized{audio_status}! {saved_count} frames, saved to video_{video_timestamp}/"
     last_status_type = "success"
     
     return output_video
